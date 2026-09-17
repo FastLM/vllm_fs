@@ -61,6 +61,89 @@ vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
 
 Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
 
+## ForkServe
+
+ForkServe maps an agentic step to a rooted token tree. Let \(b\) be KV bytes per token (one sequence, all layers), \(P\) the scheduler page size, \(L=|x|\) the trunk length, \(k\) the number of live children, \(\ell_i\) the residual of child \(i\), and \(r=L \bmod P\) the unaligned tail. After a winner \(\star\) is bound, only \(L+\ell_\star\) remains live.
+
+\[
+M_{\mathrm{clone}}=b\Bigl(kL+\sum_{i=1}^{k}\ell_i\Bigr),\qquad
+M_{\mathrm{CoW}}=b\Bigl(L+\sum_{i=1}^{k}\ell_i\Bigr),\qquad
+M_{\mathrm{spine}}=b(L+\ell_\star).
+\]
+
+### Automatic Prefix Caching (APC)
+
+vLLM V1 APC is a content-addressed index of *full* pages. The key of a page is \(h=\mathrm{hash}(h_{\mathrm{parent}},\,t_{0:P},\,\mathrm{extra})\). `get_computed_blocks` returns a prefix whose length is a multiple of \(P\), capped at \(n-1\). Partial-hit CoW copies \(P\) rows, not the occupied prefix \(n_{\mathrm{valid}}\). v1 block tables are append-only: one hash may map to several physical pages until the owner is freed.
+
+Sharing is discovered by hashing the *new* prompt. There is no parent pointer. If \(k\) siblings look up before any page is published (same-batch / first fan-out), every lookup misses and APC stores \(M_{\mathrm{clone}}\). On an aligned hash-hit (\(r=0\)) APC stores \(M_{\mathrm{CoW}}\). On an unaligned hash-hit the tail is private per child:
+
+\[
+M_{\mathrm{APC}}^{\mathrm{hit,}\,r>0}
+=b\Bigl(L+\sum_{i=1}^{k}\ell_i+(k-1)r\Bigr).
+\]
+
+### Location-addressed CoW
+
+ForkServe addresses pages by the parent table, not by content hash. A logical table is \(\sigma_v=(\pi(v),\,\mathrm{alias\_len},\,\mathrm{residual})\). `fork` aliases \(\sigma_{\pi(v)}\) *before* \(\ell_i\) exists and increments the parent frames (extra-pin on owned, non-RO pages so a parent `free` does not drop the trunk). A write that lands on \(\mathrm{ro}\lor\mathrm{ref}>1\) allocates a residual page and copies \(n_{\mathrm{valid}}\) rows. Abort decrefs residual pages only; cost \(\Theta(\ell_i/P)\), independent of \(L\).
+
+Committed full pages are published into APC. Speculative pages are never hashed and never sampled. Intra-session fan-out does not walk \(h\) on the allocate path. Ordinary requests without a parent pointer still use APC unchanged.
+
+### Adaptive tail
+
+Let \(\ell\) be a common residual length. Frame counts for the unaligned tail:
+
+\[
+N_{\mathrm{pack}}=k\left\lceil\frac{r+\ell}{P}\right\rceil,\qquad
+N_{\mathrm{freeze}}=1+k\left\lceil\frac{\ell}{P}\right\rceil.
+\]
+
+Choose \(\arg\min\{N_{\mathrm{pack}},N_{\mathrm{freeze}}\}\). Pack copies the \(r\) occupied rows into each child's first residual page. Freeze marks the parent's last page RO with \(n_{\mathrm{valid}}=r\) and shares it once.
+
+PagedAttention maps token \(t\) as \((\mathrm{block\_table}[\lfloor t/P\rfloor],\,t\bmod P)\) and assumes every page except the last is full. A frozen page with \(n_{\mathrm{valid}}=r<P\) in the *middle* of a child sequence is therefore a correctness bug unless the slot map is fork-aware. The implemented path is pack plus row copy; freeze is accounted for comparison only.
+
+### Implementation
+
+| Component | Role |
+|---|---|
+| `KVCacheBlock.ro`, `.n_valid`, `.is_speculative` | CoW bit, occupancy, eviction class |
+| `ForkServeTracker.try_alias` | bind \(\sigma_{\pi(v)}\) without walking \(h\) |
+| `pin_readonly` / extra-pin | \(\mathrm{ref}\) independent of parent request lifetime |
+| `cow_copy_kv_rows` | copy \(n_{\mathrm{valid}}\) rows, not \(P\) |
+| APC `cached_block_hash_to_block` | secondary, commit-time index |
+
+### Evaluation
+
+Protocol: \(P=16\). APC: construct \(k\) children, call `get_computed_blocks` on all, then allocate (hashes unpublished \(\Rightarrow\) miss). ForkServe: allocate parent \(x\), then children \((x,\rho_i)\) with `forkserve_parent`. Live **blk** \(=|\{p:\mathrm{ref}(p)>0\}|\) in a one-layer pool. GiB uses Llama-3-8B GQA bf16,
+
+\[
+b=2\cdot 32\cdot 8\cdot 128\cdot 2=128\,\mathrm{KiB/tok},\qquad
+\mathrm{GiB}=\frac{b}{2^{30}}\times\text{allocated slots}.
+\]
+
+Allocated slots:
+
+\[
+S_{\mathrm{clone}}=k\left\lceil\frac{L+\ell}{P}\right\rceil P,\qquad
+S_{\mathrm{pack}}=(L-r)+k\left\lceil\frac{r+\ell}{P}\right\rceil P.
+\]
+
+Saving on live frames: \(1-N_{\mathrm{FS}}/N_{\mathrm{APC}}\).
+
+| Workload | \(L\) | \(k\) | \(\ell\) | \(N_{\mathrm{APC}}\) | \(N_{\mathrm{FS}}\) | \(1-N_{\mathrm{FS}}/N_{\mathrm{APC}}\) | APC GiB | FS GiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| aligned_fanout_4 | 2048 | 4 | 64 | 528 | 144 | 72.7% | 1.03 | 0.28 |
+| aligned_fanout_8 | 4096 | 8 | 128 | 2112 | 320 | 84.8% | 4.12 | 0.62 |
+| unaligned_pack | 2050 | 4 | 48 | 528 | 145 | 72.5% | 1.03 | 0.28 |
+| tot_wide | 8192 | 8 | 32 | 4112 | 528 | 87.2% | 8.03 | 1.03 |
+| short_residual | 1024 | 6 | 4 | 390 | 70 | 82.1% | 0.76 | 0.14 |
+| planner_specialists | 16384 | 4 | 256 | 4160 | 1088 | 73.8% | 8.12 | 2.12 |
+
+```bash
+source "$HOME/envs/forkserve/bin/activate"
+python -m pytest tests/v1/core/test_forkserve.py -q --noconftest
+python benchmarks/forkserve/compare_apc.py
+```
+
 ## Getting Started
 
 Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
