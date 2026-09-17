@@ -787,7 +787,14 @@ def copy_kv_cache_blocks_inplace(
         scheduler_block_stride = (
             cache.stride(0) * cache.element_size() * kernel_blocks_per_block
         )
-        if storage.nbytes() == num_blocks * scheduler_block_stride:
+        needs_row_copy = any(
+            0 < copy.n_valid < copy.block_size for copy in kv_cache_block_copies
+        )
+        # Compact uint8 view is full-page only; n_valid CoW needs the token axis.
+        if (
+            not needs_row_copy
+            and storage.nbytes() == num_blocks * scheduler_block_stride
+        ):
             if storage_key in copied_storages:
                 continue
             copied_storages.add(storage_key)
