@@ -769,7 +769,11 @@ def copy_kv_cache_blocks_inplace(
         seen.add(key)
 
         if indices is None:
-            indices = async_tensor_h2d(indices_np, device=cache.device)
+            if cache.device.type == "cpu":
+                # CPU torch has no pinned-memory allocator; skip H2D staging.
+                indices = torch.as_tensor(indices_np, device=cache.device)
+            else:
+                indices = async_tensor_h2d(indices_np, device=cache.device)
         assert cache.device == indices.device
         src, dst = indices.unbind(dim=1)
 
