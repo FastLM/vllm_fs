@@ -682,6 +682,69 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 layer.impl._v_scale_cache = None
 
 
+def _copy_block_rows(
+    blocks: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    copies: Sequence[KVCacheBlockCopy],
+) -> None:
+    """Copy scheduler blocks. ``n_valid>0`` copies a token-prefix, not the page."""
+    full_idx = [
+        i
+        for i, copy in enumerate(copies)
+        if copy.n_valid <= 0 or copy.block_size <= 0 or copy.n_valid >= copy.block_size
+    ]
+    if len(full_idx) == len(copies):
+        blocks[dst] = blocks[src]
+        return
+    if full_idx:
+        idx = torch.tensor(full_idx, device=src.device, dtype=torch.long)
+        blocks[dst.index_select(0, idx)] = blocks[src.index_select(0, idx)]
+    for i, copy in enumerate(copies):
+        if i in full_idx:
+            continue
+        cow_copy_kv_rows(
+            blocks,
+            int(src[i].item()),
+            int(dst[i].item()),
+            n_valid=copy.n_valid,
+            block_size=copy.block_size,
+        )
+
+
+def cow_copy_kv_rows(
+    blocks: torch.Tensor,
+    src_block_id: int,
+    dst_block_id: int,
+    *,
+    n_valid: int,
+    block_size: int,
+) -> None:
+    """Copy the first ``n_valid`` token rows of a scheduler block.
+
+    ``blocks`` is ``[num_blocks, ...]``. If a dimension equals ``block_size``,
+    that axis is treated as the token axis (NHD / HND / kernel-split).
+    Otherwise a leading fraction of the flattened page is copied — the
+    APC-safe fallback when layout metadata is missing.
+    """
+    src = blocks[src_block_id]
+    dst = blocks[dst_block_id]
+    if n_valid <= 0 or block_size <= 0 or n_valid >= block_size:
+        dst.copy_(src)
+        return
+    for dim, size in enumerate(src.shape):
+        if size == block_size:
+            sl = [slice(None)] * src.ndim
+            sl[dim] = slice(0, n_valid)
+            key = tuple(sl)
+            dst[key] = src[key]
+            return
+    flat_src = src.reshape(-1)
+    flat_dst = dst.reshape(-1)
+    n = max(1, int(flat_src.numel() * n_valid / block_size))
+    flat_dst[:n] = flat_src[:n]
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
@@ -690,7 +753,10 @@ def copy_kv_cache_blocks_inplace(
     if not kv_cache_block_copies:
         return
 
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    indices_np = np.array(
+        [(c.src_block_id, c.dst_block_id) for c in kv_cache_block_copies],
+        dtype=np.int64,
+    )
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
@@ -728,7 +794,7 @@ def copy_kv_cache_blocks_inplace(
             # Fold virtual block splitting into the shape so that dim 0 counts
             # scheduler blocks; unflatten of dim 0 is always a view.
             blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
-        blocks[dst] = blocks[src]
+        _copy_block_rows(blocks, src, dst, kv_cache_block_copies)
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:

@@ -198,6 +198,12 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # ForkServe CoW: writes must not land on a read-only or shared frame.
+    ro: bool = False
+    # Occupied token rows in [1, block_size]. 0 means "treat as full" (APC).
+    n_valid: int = 0
+    # Speculative residual pages are evicted before committed trunk pages.
+    is_speculative: bool = False
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -241,6 +247,9 @@ class KVCacheBlock:
 class KVCacheBlockCopy(NamedTuple):
     src_block_id: int
     dst_block_id: int
+    # 0 = copy the whole scheduler block (APC default).
+    n_valid: int = 0
+    block_size: int = 0
 
 
 class FreeKVCacheBlockQueue:

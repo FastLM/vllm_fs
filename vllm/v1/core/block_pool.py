@@ -683,12 +683,18 @@ class BlockPool:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.ro = False
+                block.n_valid = 0
+                block.is_speculative = False
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.ro = False
+                block.n_valid = 0
+                block.is_speculative = False
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
@@ -763,7 +769,22 @@ class BlockPool:
 
     def is_block_writable(self, block: KVCacheBlock) -> bool:
         """Return whether a block can be mutated by its sole owner."""
-        return not block.is_null and block.ref_cnt == 1 and block.block_hash is None
+        return (
+            not block.is_null
+            and block.ref_cnt == 1
+            and block.block_hash is None
+            and not block.ro
+        )
+
+    def count_live_blocks(self) -> int:
+        """Physical frames with a live ref, excluding the null block."""
+        return sum(1 for b in self.blocks if b.ref_cnt > 0 and not b.is_null)
+
+    def pin_readonly(self, blocks: Sequence[KVCacheBlock]) -> None:
+        """Mark frames read-only so a later write CoW-faults (ForkServe)."""
+        for block in blocks:
+            if not block.is_null:
+                block.ro = True
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
@@ -784,9 +805,12 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
-                if block.block_hash is None or not self.enable_caching:
-                    # LIFO reuse of non-cached blocks for better GPU locality.
+                if block.is_speculative or block.block_hash is None or not self.enable_caching:
+                    # Speculative residuals and unhashed frames reuse first.
                     blocks_to_evict_first.append(block)
+                    block.ro = False
+                    block.n_valid = 0
+                    block.is_speculative = False
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
                     blocks_to_evict_last.append(block)

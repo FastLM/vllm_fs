@@ -467,6 +467,12 @@ class SingleTypeKVCacheManager(ABC):
         assert req_blocks[block_idx] is source_block
         assert not source_block.is_null and source_block.ref_cnt > 0
         req_blocks[block_idx] = cow_block
+        n_valid = source_block.n_valid
+        if n_valid <= 0 and source_block.block_hash_num_tokens:
+            rem = source_block.block_hash_num_tokens % self.block_size
+            n_valid = rem if rem else 0
+        source_block.n_valid = n_valid
+        cow_block.n_valid = n_valid
         self._pending_cow_copies.append((source_block, cow_block))
         cow_block.ref_cnt += 1
 

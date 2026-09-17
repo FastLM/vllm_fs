@@ -9,6 +9,7 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.forkserve import ForkServeTracker
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -222,6 +223,7 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        self.forkserve = ForkServeTracker()
 
     @property
     def usage(self) -> float:
@@ -285,6 +287,10 @@ class KVCacheManager:
         # or calls a pooling model with all pooling).
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
+
+        aliased = self.forkserve.try_alias(self, request)
+        if aliased is not None:
+            return aliased
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
@@ -600,6 +606,8 @@ class KVCacheManager:
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
+        self.forkserve.snapshot_if_needed(self, request)
+
         return self.create_kv_cache_blocks(new_blocks)
 
     def free(self, request: Request) -> None:
@@ -611,6 +619,7 @@ class KVCacheManager:
             request: The request to free the blocks.
 
         """
+        self.forkserve.release(self, request)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -884,17 +893,22 @@ class KVCacheManager:
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
         """Drain pending copies and return their retained endpoints."""
-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock, int]] = []
         for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
+            pending_copies.extend(
+                (src, dst, mgr.block_size)
+                for src, dst in mgr.take_pending_cow_copies()
+            )
         copies = [
             KVCacheBlockCopy(
                 src_block_id=source_block.block_id,
                 dst_block_id=cow_block.block_id,
+                n_valid=int(source_block.n_valid or 0),
+                block_size=block_size,
             )
-            for source_block, cow_block in pending_copies
+            for source_block, cow_block, block_size in pending_copies
         ]
-        retained_blocks = [block for pair in pending_copies for block in pair]
+        retained_blocks = [block for pair in pending_copies for block in pair[:2]]
         return copies, retained_blocks
 
     def take_boundary_state_offloads(
